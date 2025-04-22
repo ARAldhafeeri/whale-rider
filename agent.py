@@ -1615,7 +1615,7 @@ class AutonomousAgent:
             self.log(f"\n=== Iteration {self.current_iteration + 1}/{self.max_iterations} ===")
             
             # Get human feedback before starting the iteration
-            # user_feedback = self.get_human_feedback("Give the agent any specific input before the iteration start:")
+            user_feedback = self.get_human_feedback("Give the agent any specific input before the iteration start:")
             
             # Save checkpoint before the iteration
             self.save_checkpoint()
@@ -1638,7 +1638,7 @@ class AutonomousAgent:
                 "pending_goals": len([g for g in self.goals if g['status'] == 'PENDING']),
                 "new_tools": len(self.custom_tools),
                 "timestamp": datetime.now().isoformat(),
-                # "user_feedback": user_feedback if user_feedback else ""
+                "user_feedback": user_feedback if user_feedback else ""
             }
             
             self.agent_memory['system']['iterations'].append(iteration_log)
