@@ -1,0 +1,19 @@
+# Core dependencies
+httpx==0.27.0
+argparse
+python-dotenv==1.0.0
+pydantic==2.11.3
+
+# LangChain components
+langchain-core==0.3.52
+langchain-openai==0.3.13
+langchain-text-splitters==0.3.2
+
+# Vector database
+chromadb==0.5.15
+
+# Search tools
+duckduckgo_search==8.0.1
+
+# OpenAI
+openai==1.75.0
