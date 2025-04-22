@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import importlib.util
 import subprocess
+import shutil
 import re
 import time
 import httpx 
@@ -194,17 +195,34 @@ def math_calc(expression: str) -> str:
 def execute_python(code: str) -> str:
     """Execute Python code directly (in workspace environment)"""
     try:
-        # Ensure workspace directory exists
-        if not os.path.exists("./workspace"):
-            os.makedirs("./workspace")
+        # Get the current directory name
+        current_dir = os.path.basename(os.getcwd())
+        
+        # Set workspace path based on current directory
+        if current_dir == "workspace":
+            workspace_path = "."
+        else:
+            workspace_path = "./workspace"
             
+        # Ensure workspace directory exists
+        if not os.path.exists(workspace_path):
+            os.makedirs(workspace_path)
+        
         # Create a temporary script file in workspace
-        script_file = "./workspace/temp_python_script.py"
+        script_file = f"{workspace_path}/temp_python_script.py"
         with open(script_file, 'w') as f:
             f.write(code)
         
         # Execute the script
-        result = subprocess.run(['python', script_file], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(['python', script_file], capture_output=True, text=True, timeout=20)
+        
+        # Create dir for executed python
+        executed_path = f"{workspace_path}/executed_python"
+        if not os.path.exists(executed_path):
+            os.makedirs(executed_path)
+
+        # Move the script to executed python dir
+        shutil.copyfile(script_file, f"{executed_path}/{id_generator()}.py")
         
         # Clean up
         if os.path.exists(script_file):
@@ -216,6 +234,7 @@ def execute_python(code: str) -> str:
         return f"Execution Result:\n{result.stdout}\nErrors:\n{result.stderr}"
     except Exception as e:
         return f"Execution failed: {str(e)}"
+    
 
 def system_info(dummy: str) -> str:
     """Get basic system information"""
@@ -280,7 +299,7 @@ class AutonomousAgent:
             os.makedirs("./workspace")
         
         # Initialize LangChain components
-        self.llm = ChatOpenAI(api_key=api_key, base_url=api_base, model=model, temperature=0.5)
+        self.llm = ChatOpenAI(api_key=api_key, base_url=api_base, model=model, temperature=0.80,   max_tokens=15000)
         
         self.embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction()
         # Create vector store for persistent memory
@@ -418,20 +437,19 @@ class AutonomousAgent:
         """Generate a focused set of initial goals based on the objective"""
         prompt = PromptTemplate.from_template(
             """
-            Break down this objective into 2-3 sequential, focused goals: {objective}
-            
+            Break down this objective into sequential, focused goals: {objective}
+            Make sure the goals acheive the objective
             Remember that it's better to have fewer, well-defined goals than too many broad ones.
+            Make sure the goals are well defined with specific outcomes and clear steps to achieve them.
             Each goal should be concrete, measurable, and directly contributes to the main objective.
-            
+            Add goals to check if goals are completed or not based on the objective.
+            The goals you generate should ressible the objective to acheive.
             Return a JSON array of goal objects with 'description' and 'priority' fields.
-            
+            Priority should be a number indicating the importance of the goal (1 being the highest priority).
             IMPORTANT :
                 for every completed goal, please call the documentation tool and output documnetation
-            Example: 
-            [
-              {"description": "Set up basic workspace environment and explore system capabilities", "priority": 1},
-              {"description": "Develop initial implementation focusing on the core requirement", "priority": 2}
-            ]
+                The output should be detailed and include detailed summary of whatever the output of 
+                acheived goal is.
             """
         )
         
@@ -449,15 +467,22 @@ class AutonomousAgent:
             
             new_goals = json.loads(response)
             
-            # Limit to 2-3 goals initially
-            for i, goal in enumerate(new_goals[:3]):
-                self._add_goal(goal['description'], goal.get('priority', i+1))
+            self._add_goal("Break down this objective into sequential, focused goals that represent full plan to acehieve the objective", 1)
+            priority_map = {
+                "high": 1,
+                "medium": 2,
+                "low": 3,
+            }            
+            for i, goal in enumerate(new_goals):
+                priority = goal.get('priority', 1)
+                if isinstance(priority, str):
+                    priority = priority_map.get(priority.lower(), 1)
+                self._add_goal(goal['description'], )
             
-            self.log(f"Generated {len(new_goals[:3])} focused initial goals")
+            self.log(f"Generated {len(new_goals)} focused initial goals")
         except Exception as e:
             self.log_error(f"Failed to parse goals: {str(e)}")
             # Add a single default goal if parsing fails
-            self._add_goal("Set up workspace environment and analyze the objective", 1)
 
     def create_tool(self, description: str, input_schema=None) -> bool:
         """Create a custom tool using LangChain"""
@@ -638,7 +663,7 @@ class AutonomousAgent:
         self.log(f"Processing goal: {goal['description']} (priority: {goal['priority']})")
         
         # Get human feedback before executing goal
-        self.get_human_feedback(f"About to execute goal: {goal['description']}\nAny specific instructions?")
+        # self.get_human_feedback(f"About to execute goal: {goal['description']}\nAny specific instructions?")
         
         result = self._execute_goal(goal)
         
@@ -784,41 +809,6 @@ class AutonomousAgent:
             self.log(f"Checkpoint save failed: {str(e)}", "ERROR")
             return None
 
-    @classmethod
-    def load_from_checkpoint(cls, checkpoint_path):
-        """Load agent from a checkpoint file"""
-        try:
-            with open(checkpoint_path, 'r') as f:
-                checkpoint = json.load(f)
-                
-            # Create new agent with checkpoint data
-            agent = cls(
-                objective=checkpoint["objective"],
-                max_iterations=checkpoint["max_iterations"],
-                verbose=True  # Default to verbose for recovered agents
-            )
-            
-            # Restore state
-            agent.current_iteration = checkpoint["current_iteration"]
-            agent.goals = checkpoint["goals"]
-            agent.agent_memory = checkpoint["agent_memory"]
-            agent.human_feedback = checkpoint["human_feedback"]
-            
-            # Restore custom tools
-            for name, tool_data in checkpoint["custom_tools"].items():
-                # Reconstruct the tool from code
-                agent.create_tool(tool_data["description"])
-                
-            print(f"Agent successfully restored from checkpoint: {checkpoint_path}")
-            print(f"Objective: {agent.objective}")
-            print(f"Current iteration: {agent.current_iteration}/{agent.max_iterations}")
-            print(f"Goals: {len(agent.goals)} ({len([g for g in agent.goals if g['status'] == 'COMPLETED'])} completed)")
-            
-            return agent
-        except Exception as e:
-            print(f"Failed to load checkpoint: {str(e)}")
-            return None
-
     def _execute_goal(self, goal):
         """Execute a goal using multiple tools in sequence based on recommendations"""
         try:
@@ -829,7 +819,7 @@ class AutonomousAgent:
             # Get recommended tools for this goal
             recommended_tools = self.recommend_tools(goal_description)
             
-            # If no specific tools recommended, use all available
+            # TODO: If no specific tools recommended, use all available
             if not recommended_tools:
                 self.log("No specific tools recommended, using general approach", "WARNING")
                 return self._execute_goal_with_agent(goal)
@@ -1102,7 +1092,7 @@ class AutonomousAgent:
             For this goal: {goal_description}
             
             Please provide:
-            1. A concise summary of findings (3-5 bullet points)
+            1. A detailed summary of findings
             2. Key insights gained
             3. Whether the goal appears to be successfully completed
             4. Any recommendations for follow-up actions
@@ -1214,11 +1204,12 @@ class AutonomousAgent:
             3. Next Steps: What specific, concrete actions are now needed to advance toward the objective?
             
             Choose exactly ONE action:
-            1. Create new sub-goals (specify 1-3 clear, measurable goals to address gaps)
+            1. Create new sub-goals (specify 1-3 clear, measurable goals to address gaps) of the original goal
             2. Create a new tool (only if a specific capability gap exists)
             3. Mark objective as complete (ONLY if truly 100% achieved and verified)
             4. Continue with existing goals (if they're sufficient to complete the objective)
-            
+            5. Revesit an existing goal (if it needs to be re-evaluated)
+            6. Add more sub goals
             Return a JSON object with format:
             {{"action":"create_goals"|"create_tool"|"complete"|"continue",
             "reasoning":"Detailed explanation for your decision including progress assessment",
@@ -1624,7 +1615,7 @@ class AutonomousAgent:
             self.log(f"\n=== Iteration {self.current_iteration + 1}/{self.max_iterations} ===")
             
             # Get human feedback before starting the iteration
-            user_feedback = self.get_human_feedback("Give the agent any specific input before the iteration start:")
+            # user_feedback = self.get_human_feedback("Give the agent any specific input before the iteration start:")
             
             # Save checkpoint before the iteration
             self.save_checkpoint()
@@ -1647,7 +1638,7 @@ class AutonomousAgent:
                 "pending_goals": len([g for g in self.goals if g['status'] == 'PENDING']),
                 "new_tools": len(self.custom_tools),
                 "timestamp": datetime.now().isoformat(),
-                "user_feedback": user_feedback if user_feedback else ""
+                # "user_feedback": user_feedback if user_feedback else ""
             }
             
             self.agent_memory['system']['iterations'].append(iteration_log)
@@ -1676,7 +1667,7 @@ class AutonomousAgent:
                 try:
                     check_result = check_chain.invoke({
                         "objective": self.objective,
-                        "human_input": user_feedback,
+                        # "human_input": user_feedback,
                         "completed_goals": json.dumps([g for g in self.goals if g['status'] == 'COMPLETED'], indent=2)
                     })
                     
