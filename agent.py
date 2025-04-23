@@ -13,6 +13,7 @@ import string
 import random
 from typing import List, Dict, Any, Optional
 from duckduckgo_search import DDGS
+import threading
 
 # Updated LangChain imports
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
@@ -316,6 +317,12 @@ class AutonomousAgent:
         self.base_tools = self._load_base_tools()
         self.custom_tools = {}
         
+
+        self.execution_locks = {}  # Thread locks for each tool
+        self.worker_threads = {}   # Worker threads pool
+        self.max_threads = os.cpu_count() or 4  # Default to machine's CPU count
+        self.thread_semaphore = threading.Semaphore(self.max_threads)  # Control concurrent threads
+        self.results_lock = threading.Lock()  # Lock for writing to shared results
         # Initialize agent memory
         self._initialize_memory()
 
@@ -339,7 +346,8 @@ class AutonomousAgent:
                 "goals": [],
                 "tools": [],
                 "reflections": [],
-                "human_feedback": []
+                "human_feedback": [],
+                "task_analysis": []
             }
         else:
             with open(self.memory_file, 'r') as f:
@@ -815,8 +823,9 @@ class AutonomousAgent:
             self.log(f"Checkpoint save failed: {str(e)}", "ERROR")
             return None
 
+
     def _execute_goal(self, goal):
-        """Execute a goal using multiple tools in sequence based on recommendations"""
+        """Execute a goal using multiple tools in sequence based on recommendations with improved threading"""
         try:
             # Extract goal information
             goal_description = goal.get("description", "No description provided")
@@ -824,11 +833,6 @@ class AutonomousAgent:
             
             # Get recommended tools for this goal
             recommended_tools = self.recommend_tools(goal_description)
-            
-            # TODO: If no specific tools recommended, use all available
-            # if not recommended_tools:
-            #     self.log("No specific tools recommended, using general approach", "WARNING")
-            #     return self._execute_goal_with_agent(goal)
             
             # Color mapping for tool outputs
             colors = {
@@ -841,6 +845,8 @@ class AutonomousAgent:
                 "system_info": "\033[1;97m",      # Bold White
                 "read_directory": "\033[1;90m",   # Bold Gray
                 "create_documentation": "\033[1;92m", # Bold Green
+                "code_generator": "\033[1;96m",   # Bold Cyan
+                "code_analyzer": "\033[1;95m",    # Bold Magenta
             }
             default_color = ""  # Reset color
             
@@ -860,15 +866,31 @@ class AutonomousAgent:
             execution_plans = [plan for plan in self.agent_memory.get('tool_execution_plans', []) 
                             if plan.get('goal') == goal_description]
             
+            is_coding_task = self._is_coding_task(goal_description)
             # Use the execution order from plan if available
             if execution_plans and 'execution_order' in execution_plans[-1]:
                 tool_execution_order = execution_plans[-1]['execution_order']
             else:
-                tool_execution_order = recommended_tools
+                # Determine if this is a coding-focused task
+                
+                if is_coding_task:
+                    # For coding tasks, prioritize code generation and analysis tools
+                    tool_execution_order = self._optimize_tool_order_for_coding(recommended_tools)
+                else:
+                    # Use recommended order for research tasks
+                    tool_execution_order = recommended_tools
                 
             # Initialize progress tracking
             total_tools = len(tool_execution_order)
             completed_tools = 0
+            
+            # For coding tasks, add initial planning step
+            if is_coding_task:
+                print(f"\n{BOLD}🔍 ANALYZING CODING TASK")
+                print(f"{'▼'*50}")
+                coding_plan = self._generate_coding_plan(goal_description)
+                print(f"\033[1;96m📋 CODING PLAN:\n{coding_plan}\033[0m")
+                print(f"{'▲'*50}\n")
             
             # Execute tools in the determined order
             for tool_name in tool_execution_order:
@@ -896,7 +918,7 @@ class AutonomousAgent:
                 print(f"🔧 {BOLD}Running tool: \033[1;93m{tool_name}")
                 
                 # Generate input for this tool based on previous results
-                tool_input = self._generate_tool_input(tool, goal_description, results)
+                tool_input = self._generate_tool_input(tool, goal_description, results, is_coding_task)
                 
                 # Execute the tool with enhanced visual display
                 color = colors.get(tool_name, default_color)
@@ -906,13 +928,25 @@ class AutonomousAgent:
                 # Execute and capture result
                 start_time = time.time()
                 try:
-                    result = self._execute_single_tool(tool, tool_input)
+                    # Acquire lock for this tool to prevent race conditions
+                    if tool_name not in self.execution_locks:
+                        self.execution_locks[tool_name] = threading.Lock()
+                        
+                    with self.execution_locks[tool_name]:
+                        result = self._execute_single_tool(tool, tool_input)
+                    
                     execution_time = time.time() - start_time
                     
                     # Store result
-                    results[tool_name] = result
-                    all_raw_outputs[tool_name] = result
+                    with self.results_lock:
+                        results[tool_name] = result
+                        all_raw_outputs[tool_name] = result
                     
+                    # Process code results for better coherence
+                    if tool_name in ["execute_python", "code_generator"] and isinstance(result, str):
+                        # Extract clean code from output
+                        result = self._process_code_output(result, tool_name)
+                        
                     # Add to summary
                     execution_summary.append({
                         "tool": tool_name,
@@ -947,8 +981,12 @@ class AutonomousAgent:
                     # Display error
                     print(f"\033[91m❌ FAILED [{execution_time:.2f}s]: {str(e)}")
             
-            # Generate multi-format outputs after all tools are executed
-            outputs = self._generate_comprehensive_outputs(goal, recommended_tools, execution_summary, results, all_raw_outputs)
+            # If this was a coding task, generate a final code summary
+            if is_coding_task:
+                outputs = self._generate_coding_focused_outputs(goal, recommended_tools, execution_summary, results, all_raw_outputs)
+            else:
+                # For research tasks, use the original comprehensive outputs
+                outputs = self._generate_comprehensive_outputs(goal, recommended_tools, execution_summary, results, all_raw_outputs)
             
             # Create documentation
             self._create_execution_documentation(goal, recommended_tools, execution_summary, results, outputs)
@@ -967,11 +1005,211 @@ class AutonomousAgent:
             self.log_error(f"Goal execution failed: {str(e)}")
             return False
 
-    def _generate_tool_input(self, tool, goal_description, previous_results):
+    def _is_coding_task(self, goal_description: str) -> bool:
+        """
+        Determine if a task is coding-focused using LLM analysis with structured response.
+        
+        Args:
+            goal_description: The description of the task/goal to analyze
+            
+        Returns:
+            bool: True if this is a coding task, False otherwise
+        """
+        prompt = PromptTemplate(
+            input_variables=["goal_description"],
+            template="""
+    Analyze the following task description and determine if it requires significant coding work:
+
+    Task: {goal_description}
+
+    Consider these indicators of coding tasks:
+    1. Requires writing or modifying code (scripts, functions, classes)
+    2. Involves programming concepts (algorithms, data structures)
+    3. Needs software development (applications, libraries, APIs)
+    4. Requires debugging or optimizing existing code
+    5. Involves technical implementation details
+
+    Return a JSON response with:
+    1. "is_coding_task": boolean (true/false)
+    2. "confidence": float (0.0-1.0) indicating confidence level
+    3. "indicators": array of strings explaining what suggests coding is needed
+    4. "required_skills": array of relevant programming skills if applicable
+
+    Example responses:
+    {{
+        "is_coding_task": true,
+        "confidence": 0.9,
+        "indicators": ["mentions 'write a Python script'", "requires API development"],
+        "required_skills": ["Python", "FastAPI"]
+    }}
+
+    {{
+        "is_coding_task": false,
+        "confidence": 0.95,
+        "indicators": ["only requires data analysis without implementation"],
+        "required_skills": []
+    }}
+    """
+        )
+        
+        # Create analysis chain
+        analysis_chain = prompt | self.llm | StrOutputParser()
+        
+        try:
+            response = analysis_chain.invoke({
+                "goal_description": str(goal_description)
+            })
+            
+            # Parse JSON response
+            try:
+                json_match = re.search(r'\{.*\}', response.replace('\n', ''), re.DOTALL)
+                if json_match:
+                    analysis = json.loads(json_match.group())
+                    
+                    # Store analysis in agent memory
+                    try:
+                        self.agent_memory['task_analysis'].append({
+                        "goal": goal_description,
+                        "analysis": analysis,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    except:
+                        print("FAILED to update memory with coding anlaysis")
+                    
+                    # Log the decision
+                    self.log(
+                        f"Coding task analysis: {analysis.get('is_coding_task', False)} "
+                        f"(confidence: {analysis.get('confidence', 0)})",
+                        "INFO"
+                    )
+                    
+                    return bool(analysis.get('is_coding_task', False))
+                
+                # Fallback to keyword matching if JSON parsing fails
+                return self._basic_coding_task_check(goal_description)
+                
+            except json.JSONDecodeError:
+                self.log(f"Could not parse coding task analysis: {response}", "WARNING")
+                return self._basic_coding_task_check(goal_description)
+                
+        except Exception as e:
+            self.log(f"Coding task analysis failed: {str(e)}", "ERROR")
+            return self._basic_coding_task_check(goal_description)
+
+
+    def _basic_coding_task_check(self, description: str) -> bool:
+        """Fallback keyword-based coding task detection"""
+        coding_phrases = {
+            "write code", "create a program", "develop software",
+            "build an app", "implement an algorithm", "write a script",
+            "create a library", "develop a module", "debug the code",
+            "refactor the", "optimize the", "programming solution"
+        }
+        description_lower = description.lower()
+        return any(phrase in description_lower for phrase in coding_phrases)
+   
+   
+    def _optimize_tool_order_for_coding(self, recommended_tools):
+        """Optimize tool execution order for coding tasks"""
+        # Define preferred order for coding tasks
+        coding_order_priority = [
+            "code_analyzer",           # First analyze requirements
+            "web_search",              # Search for relevant information
+            "read_directory",          # Understand existing code structure
+            "file_operations",         # Read existing files
+            "code_generator",          # Generate code
+            "execute_python",          # Test the code
+            "run_os_command",          # Run system commands if needed
+            "create_documentation",    # Document the result
+            "web_scrape",              # Lower priority for coding tasks
+            "math_calculation",
+            "system_info"
+        ]
+        
+        # Sort tools based on priority for coding tasks
+        return sorted(
+            recommended_tools,
+            key=lambda x: coding_order_priority.index(x) if x in coding_order_priority else 999
+        )
+    
+    def _generate_coding_plan(self, goal_description):
+        """Generate a detailed coding plan for the goal"""
+        # Define a prompt template for coding plan
+        prompt_template = """
+        I need to create a detailed coding plan for implementing the following:
+        
+        GOAL: {goal_description}
+        
+        Please provide a detailed plan including:
+        1. Problem analysis and understanding
+        2. Proposed architecture or design 
+        3. Key components/modules needed
+        4. Implementation steps in sequence
+        5. Testing strategy
+        6. Potential challenges and solutions
+        
+        Format this as a clear, structured plan that would guide efficient code implementation.
+        """
+        
+        # Execute the plan generation with LLM
+        try:
+            from langchain.prompts import PromptTemplate
+            from langchain.schema.output_parser import StrOutputParser
+            
+            prompt = PromptTemplate(template=prompt_template, input_variables=["goal_description"])
+            plan_chain = prompt | self.llm | StrOutputParser()
+            
+            # Generate the coding plan
+            coding_plan = plan_chain.invoke({"goal_description": goal_description})
+            return coding_plan
+        except Exception as e:
+            self.log(f"Error generating coding plan: {str(e)}", "WARNING")
+            return "Could not generate coding plan. Proceeding with execution."
+
+    def _process_code_output(self, raw_output, tool_name):
+        """Process and clean code output for better coherence"""
+        # Extract code blocks from the output
+        code_block_pattern = r'```(?:\w+)?\s*([\s\S]*?)\s*```'
+        code_blocks = re.findall(code_block_pattern, raw_output)
+        
+        if code_blocks:
+            # Join all code blocks with clear separation
+            processed_code = "\n\n".join(code_blocks)
+            return processed_code
+        
+        # If no code blocks found but contains Python-like patterns, try to extract
+        if re.search(r'def\s+\w+\s*\(', raw_output) or re.search(r'class\s+\w+\s*\:', raw_output):
+            # This looks like code but wasn't in code blocks
+            lines = raw_output.split('\n')
+            code_lines = []
+            in_code = False
+            
+            for line in lines:
+                if re.match(r'^\s*(def|class|import|from|if|for|while|return|#)\s', line):
+                    in_code = True
+                    code_lines.append(line)
+                elif in_code and line.strip() and not line.startswith('#'):
+                    code_lines.append(line)
+                elif in_code and not line.strip():
+                    code_lines.append('')  # Keep empty lines in code
+                elif in_code:
+                    in_code = False
+            
+            if code_lines:
+                return '\n'.join(code_lines)
+        
+        # Return original if no processing applied
+        return raw_output
+
+    def _generate_tool_input(self, tool, goal_description, previous_results, is_coding_task):
         """Intelligently generate input for a tool based on previous results"""
         # Extract tool name and schema
         tool_name = tool.name
         tool_schema = getattr(tool, 'args_schema', None)
+    
+        # For coding tasks, use specialized input generation
+        if is_coding_task and tool_name in ["code_generator", "execute_python"]:
+            return self._generate_coding_tool_input(tool_name, goal_description, previous_results)
         
         # If we have no schema, return default values
         if not tool_schema:
@@ -987,6 +1225,10 @@ class AutonomousAgent:
                 "description": field.description,
                 "metadata": field.metadata,
             }
+        
+        # Import required components
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
         
         prompt = PromptTemplate(template="""
         I need to generate input parameters for a tool called: {tool_name}
@@ -1015,7 +1257,7 @@ class AutonomousAgent:
         prev_results_formatted = ""
         for prev_tool, result in previous_results.items():
             prev_results_formatted += f"\n--- {prev_tool} RESULT ---\n"
-            prev_results_formatted += f"{result[:500]}..." if len(result) > 500 else result
+            prev_results_formatted += f"{result[:500]}..." if isinstance(result, str) and len(result) > 500 else str(result)
         
         # Execute the prompt
         input_chain = prompt | self.llm | StrOutputParser()
@@ -1063,22 +1305,371 @@ class AutonomousAgent:
             if tool_name == "system_info":
                 return {"dummy": "dummy"}
             return {"generic_input": goal_description}
+
+    def _generate_coding_tool_input(self, tool_name, goal_description, previous_results):
+        """Generate specialized input for coding tools"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
         
+        # For code generator tool
+        if tool_name == "code_generator":
+            prompt = PromptTemplate(template="""
+            I need to generate code to solve this problem:
+            
+            GOAL: {goal}
+            
+            Based on previous tool results:
+            {previous_results}
+            
+            Please provide detailed specifications for generating code:
+            1. The programming language to use
+            2. What the code should accomplish (be specific)
+            3. Any specific libraries or frameworks to use
+            4. Input/output specifications
+            5. Any specific implementation details
+            
+            Format as JSON with these exact keys:
+            {{
+                "language": "python",
+                "task": "detailed task description",
+                "libraries": ["lib1", "lib2"],
+                "specs": "detailed implementation specs"
+            }}
+            """, input_variables=["goal", "previous_results"])
+        
+        # For code execution tool
+        elif tool_name == "execute_python":
+            prompt = PromptTemplate(template="""
+            I need to execute Python code to solve this goal:
+            
+            GOAL: {goal}
+            
+            Based on previous tool results, especially any code that was generated:
+            {previous_results}
+            
+            Please extract or create the Python code to execute, and provide any necessary inputs.
+            Format as JSON with these keys:
+            {{
+                "code": "full python code to execute",
+                "inputs": {{"input1": "value1"}},
+                "timeout": 30
+            }}
+            """, input_variables=["goal", "previous_results"])
+        
+        # Format previous results for the prompt
+        prev_results_formatted = ""
+        code_found = False
+        
+        # First check for any code in previous results
+        for prev_tool, result in previous_results.items():
+            if prev_tool in ["code_generator", "execute_python"]:
+                prev_results_formatted = f"\n--- CODE FROM {prev_tool} ---\n{result}\n"
+                code_found = True
+                break
+        
+        # If no code found, include all relevant tool results
+        if not code_found:
+            for prev_tool, result in previous_results.items():
+                prev_results_formatted += f"\n--- {prev_tool} RESULT ---\n"
+                prev_results_formatted += f"{result[:500]}..." if isinstance(result, str) and len(result) > 500 else str(result)
+        
+        # Execute the prompt
+        input_chain = prompt | self.llm | StrOutputParser()
+        
+        try:
+            response = input_chain.invoke({
+                "goal": goal_description,
+                "previous_results": prev_results_formatted if prev_results_formatted else "No previous results available."
+            })
+            
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', response.replace('\n', ''), re.DOTALL)
+            if json_match:
+                try:
+                    params = json.loads(json_match.group())
+                    return params
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try to extract code blocks directly
+                    if tool_name == "execute_python":
+                        code_blocks = re.findall(r'```(?:python)?\s*([\s\S]*?)\s*```', response)
+                        if code_blocks:
+                            return {"code": code_blocks[0], "timeout": 30}
+            
+            # Fallbacks for specific tools
+            if tool_name == "code_generator":
+                return {"language": "python", "task": goal_description, "libraries": [], "specs": ""}
+            elif tool_name == "execute_python":
+                # Try to find Python code in any previous result
+                for _, result in previous_results.items():
+                    if isinstance(result, str):
+                        code_blocks = re.findall(r'```(?:python)?\s*([\s\S]*?)\s*```', result)
+                        if code_blocks:
+                            return {"code": code_blocks[0], "timeout": 30}
+                return {"code": "print('No code to execute')", "timeout": 10}
+            
+        except Exception as e:
+            self.log(f"Error generating coding tool input: {str(e)}", "ERROR")
+            # Return basic fallbacks
+            if tool_name == "code_generator":
+                return {"language": "python", "task": goal_description, "libraries": [], "specs": ""}
+            elif tool_name == "execute_python":
+                return {"code": "print('Error preparing code execution')", "timeout": 10}
 
     def _execute_single_tool(self, tool, tool_input):
         """Execute a single tool with proper error handling and timing"""
+        # Use threading to avoid blocking
+        with self.thread_semaphore:
+            try:
+                # Convert tool_input to appropriate format
+                if isinstance(tool_input, dict):
+                    # For structured tools
+                    result = tool.func(**tool_input)
+                else:
+                    # For simple tools
+                    result = tool.func(tool_input)
+                
+                return result
+            except Exception as e:
+                raise Exception(f"Tool execution error: {str(e)}")
+
+    def _generate_coding_focused_outputs(self, goal, tools_used, execution_summary, results, raw_outputs):
+        """Generate comprehensive code outputs with enhanced generation capabilities"""
         try:
-            # Convert tool_input to appropriate format
-            if isinstance(tool_input, dict):
-                # For structured tools
-                result = tool.func(**tool_input)
-            else:
-                # For simple tools
-                result = tool.func(tool_input)
+            outputs = {}
+            goal_description = goal.get("description", "No description provided")
             
-            return result
+            # Extract and format code fragments from raw outputs
+            code_results_formatted = self._format_code_fragments(raw_outputs)
+            
+            # 1. Code Expansion Phase
+            expanded_code = self._expand_code_fragments(code_results_formatted, goal_description)
+            
+            # 2. Generate Complete Solution
+            complete_solution = self._generate_complete_solution(expanded_code, goal_description)
+            
+            # 3. Validate and Fallback if Needed
+            complete_solution = self._validate_and_fallback(complete_solution, goal_description)
+            
+            # 4. Generate Documentation and Supporting Materials
+            outputs.update(self._generate_documentation(expanded_code, complete_solution, goal_description))
+            
+            # 5. Generate Usage Examples
+            outputs["usage_examples"] = self._generate_usage_examples(complete_solution, goal_description)
+            
+            # 6. Generate Code Analysis
+            outputs["code_analysis"] = self._generate_code_analysis(complete_solution)
+            
+            # Include standard outputs
+            outputs.update(self._load_standard_outputs(goal, tools_used, execution_summary, results, raw_outputs))
+            
+            return outputs
+            
         except Exception as e:
-            raise Exception(f"Tool execution error: {str(e)}")
+            self.log(f"Error generating coding-focused outputs: {str(e)}", "ERROR")
+            return self._generate_comprehensive_outputs(goal, tools_used, execution_summary, results, raw_outputs)
+
+    # Helper Methods --------------------------------------------------------------
+
+    def _format_code_fragments(self, raw_outputs):
+        """Extract and format code fragments from raw outputs"""
+        code_results_formatted = ""
+        for tool_name, result in raw_outputs.items():
+            if tool_name in ["code_generator", "execute_python"]:
+                code_results_formatted += f"\n--- {tool_name} OUTPUT ---\n"
+                code_results_formatted += result if isinstance(result, str) else str(result)
+        return code_results_formatted
+
+    def _expand_code_fragments(self, code_fragments, goal_description):
+        """Expand partial code fragments into complete implementations"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
+        
+        prompt = PromptTemplate(template="""
+        Given these code fragments for '{goal_description}':
+        
+        {code_fragments}
+        
+        Expand into a complete implementation by:
+        1. Filling all missing implementations
+        2. Adding required imports
+        3. Implementing stubs/todos
+        4. Adding error handling
+        5. Including necessary boilerplate
+        6. Ensuring it can run independently
+        
+        Return only the expanded code in markdown blocks.
+        """)
+        
+        chain = prompt | self.llm | StrOutputParser()
+        return chain.invoke({
+            "code_fragments": code_fragments,
+            "goal_description": goal_description
+        })
+
+    def _generate_complete_solution(self, expanded_code, goal_description):
+        """Generate production-ready solution from expanded code"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
+        
+        prompt = PromptTemplate(template="""
+        Refactor this code for '{goal_description}':
+        
+        {expanded_code}
+        
+        Create production-ready code that:
+        1. Follows PEP 8 and type hints
+        2. Has full error handling
+        3. Includes docstrings
+        4. Is modular and tested
+        5. Includes configuration if needed
+        6. Fully cover the use case
+        
+        Return:
+        1. Main implementation
+        2. Example tests
+        3. requirements.txt (if needed)
+        4. Usage examples in code comments
+        
+        It's Important the code fully cover the usecase.
+        Format all components in markdown with language tags.
+        """)
+        
+        chain = prompt | self.llm | StrOutputParser()
+        solution = chain.invoke({
+            "expanded_code": expanded_code,
+            "goal_description": goal_description
+        })
+        return self._extract_code_blocks(solution)
+
+    def _validate_and_fallback(self, solution, goal_description):
+        """Ensure valid code output with fallback generation"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
+        
+        if not solution.strip():
+            self.log("No code generated, attempting direct generation", "WARNING")
+            prompt = PromptTemplate(template="""
+            For: '{goal_description}'
+            
+            Generate complete Python implementation including:
+            1. All required classes/functions
+            2. Error handling
+            3. Example usage
+            4. Basic testing
+            
+            Return only the code in markdown blocks.
+            """)
+            
+            chain = prompt | self.llm | StrOutputParser()
+            solution = chain.invoke({"goal_description": goal_description})
+        
+        return self._extract_code_blocks(solution)
+
+    def _extract_code_blocks(self, content):
+        """Flexible code extraction from various formats"""
+        # Try strict markdown code blocks
+        code_blocks = re.findall(r'```(?:\w+)?\s*([\s\S]*?)\s*```', content)
+        if code_blocks:
+            return "\n\n".join(code_blocks)
+        
+        # Fallback to indented code blocks
+        code_blocks = re.findall(r'^(?: {4}|\t).*$', content, re.MULTILINE)
+        if code_blocks:
+            return "\n".join(code_blocks)
+        
+        # Final fallback - return content if it looks code-like
+        if any(kw in content for kw in ['def ', 'class ', 'import ', 'return ']):
+            return content
+        
+        return ""
+
+    def _generate_documentation(self, expanded_code, solution, goal_description):
+        """Generate comprehensive documentation"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
+        
+        prompt = PromptTemplate(template="""
+        For this code solution:
+        
+        {solution}
+        
+        And development artifacts:
+        
+        {expanded_code}
+        
+        Create full documentation for '{goal_description}' including:
+        1. Architecture overview
+        2. API reference
+        3. Installation guide
+        4. Usage examples
+        5. Testing guide
+        6. Deployment notes
+        
+        Format as Markdown with tabbed sections if needed.
+        """)
+        
+        chain = prompt | self.llm | StrOutputParser()
+        return {
+            "documentation": chain.invoke({
+                "solution": solution,
+                "expanded_code": expanded_code,
+                "goal_description": goal_description
+            })
+        }
+
+    def _generate_usage_examples(self, solution, goal_description):
+        """Generate executable usage examples"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
+        
+        prompt = PromptTemplate(template="""
+        For this code:
+        
+        {solution}
+        
+        Create 5 practical usage examples showing:
+        1. Different initialization configurations
+        2. Common use cases
+        3. Error handling scenarios
+        4. Output processing
+        5. Integration with other systems
+        
+        Make examples self-contained and executable.
+        """)
+        
+        chain = prompt | self.llm | StrOutputParser()
+        return chain.invoke({
+            "solution": solution[:10000],  # Increased size limit
+            "goal_description": goal_description
+        })
+
+    def _generate_code_analysis(self, solution):
+        """Generate technical analysis of the code"""
+        from langchain.prompts import PromptTemplate
+        from langchain.schema.output_parser import StrOutputParser
+        
+        prompt = PromptTemplate(template="""
+        Analyze this code:
+        
+        {solution}
+        
+        Provide technical analysis covering:
+        1. Code quality metrics
+        2. Performance characteristics
+        3. Security considerations
+        4. Scalability assessment
+        5. Improvement recommendations
+        
+        Use bullet points with specific code examples.
+        """)
+        
+        chain = prompt | self.llm | StrOutputParser()
+        return chain.invoke({"solution": solution[:10000]})
+
+    def _load_standard_outputs(self, *args):
+        """Load standard outputs without overriding code-focused ones"""
+        standard = self._generate_comprehensive_outputs(*args)
+        return {k: v for k, v in standard.items() if k not in ["documentation", "code"]}
 
     def _generate_comprehensive_outputs(self, goal, tools_used, execution_summary, results, raw_outputs):
         """Generate comprehensive outputs in multiple formats based on tool execution results"""
@@ -1297,10 +1888,34 @@ class AutonomousAgent:
                 else:
                     doc_content += f"{NEW_LINE}**Error:** {step.get('error', 'Unknown error')}{NEW_LINE}"
             
+            # Add code documentation section if available
+            if outputs and 'documentation' in outputs:
+                doc_content += "\n## Code Documentation\n"
+                doc_content += outputs['documentation']
+                
+                # Save complete solution to separate file if available
+                if 'complete_solution' in outputs and outputs['complete_solution']:
+                    solution_filename = f"goal_{goal_id}_solution"
+                    with open(f"./workspace/{doc_folder}/{solution_filename}", "w", encoding="utf-8") as f:
+                        f.write(outputs['complete_solution'])
+                    doc_content += f"\n[View Complete Solution](./{solution_filename})\n"
+                    
+                    # Save usage examples if available
+                    if 'usage_examples' in outputs and outputs['usage_examples']:
+                        examples_filename = f"goal_{goal_id}_examples"
+                        with open(f"./workspace/{doc_folder}/{examples_filename}", "w", encoding="utf-8") as f:
+                            f.write(outputs['usage_examples'])
+                        doc_content += f"\n[View Usage Examples](./{examples_filename})\n"
+            
             # Add detailed analysis
             if outputs and 'detailed_analysis' in outputs:
                 doc_content += "\n## Detailed Analysis\n"
                 doc_content += outputs['detailed_analysis']
+            
+            # Add code analysis if available
+            if outputs and 'code_analysis' in outputs:
+                doc_content += "\n## Code Quality Analysis\n"
+                doc_content += outputs['code_analysis']
             
             # Add visualization recommendations
             if outputs and 'visualization_recommendations' in outputs:
@@ -1318,135 +1933,406 @@ class AutonomousAgent:
                 f.write(doc_content)
                 
             # 2. Create an HTML report for interactive viewing
-            # Replace emojis with ASCII alternatives for HTML as well
-            html_content = f"""
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Goal Execution Report: {goal_description}</title>
+            # Update your template to include the marked.js library and implement markdown rendering
+            styles = """
                 <style>
-                    body {{
-                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                        line-height: 1.6;
-                        color: #333;
-                        max-width: 1200px;
+                    :root {
+                        --primary-color: #3498db;
+                        --primary-dark: #2980b9;
+                        --secondary-color: #2c3e50;
+                        --accent-color: #16a085;
+                        --success-color: #2ecc71;
+                        --warning-color: #f39c12;
+                        --danger-color: #e74c3c;
+                        --light-bg: #f8f9fa;
+                        --dark-bg: #2c3e50;
+                        --text-color: #333;
+                        --text-light: #6c757d;
+                        --text-lighter: #adb5bd;
+                        --border-color: #e0e0e0;
+                        --box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+                        --transition: all 0.3s ease;
+                        --border-radius: 8px;
+                    }
+
+                    body {
+                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+                        line-height: 1.7;
+                        color: var(--text-color);
+                        max-width: 1280px;
                         margin: 0 auto;
                         padding: 20px;
-                    }}
-                    header {{
-                        background: linear-gradient(135deg, #2c3e50, #4ca1af);
+                        background-color: #fff;
+                    }
+
+                    header {
+                        background: linear-gradient(135deg, var(--dark-bg), var(--primary-dark));
                         color: white;
-                        padding: 20px;
-                        border-radius: 8px;
-                        margin-bottom: 20px;
-                        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                    }}
-                    h1, h2, h3, h4 {{
-                        color: #2c3e50;
-                    }}
-                    .tool-card {{
-                        border: 1px solid #ddd;
-                        border-radius: 8px;
-                        margin-bottom: 20px;
+                        padding: 30px;
+                        border-radius: var(--border-radius);
+                        margin-bottom: 30px;
+                        box-shadow: var(--box-shadow);
+                        position: relative;
                         overflow: hidden;
-                    }}
-                    .tool-header {{
+                    }
+
+                    header::after {
+                        content: '';
+                        position: absolute;
+                        top: 0;
+                        right: 0;
+                        bottom: 0;
+                        left: 0;
+                        background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0));
+                        pointer-events: none;
+                    }
+
+                    h1, h2, h3, h4 {
+                        color: var(--secondary-color);
+                        margin-top: 1.5em;
+                        margin-bottom: 0.7em;
+                        font-weight: 600;
+                        line-height: 1.3;
+                    }
+
+                    h1 {
+                        font-size: 2.2rem;
+                        margin-top: 0;
+                    }
+
+                    h2 {
+                        font-size: 1.8rem;
+                    }
+
+                    h3 {
+                        font-size: 1.4rem;
+                    }
+
+                    h4 {
+                        font-size: 1.2rem;
+                    }
+
+                    .tool-card {
+                        border: 1px solid var(--border-color);
+                        border-radius: var(--border-radius);
+                        margin-bottom: 24px;
+                        overflow: hidden;
+                        transition: var(--transition);
+                        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+                    }
+
+                    .tool-card:hover {
+                        box-shadow: var(--box-shadow);
+                        transform: translateY(-2px);
+                    }
+
+                    .tool-header {
                         display: flex;
                         justify-content: space-between;
                         align-items: center;
-                        padding: 10px 15px;
-                        background-color: #f5f5f5;
-                        border-bottom: 1px solid #ddd;
-                    }}
-                    .tool-content {{
-                        padding: 15px;
-                    }}
-                    .success {{
-                        color: #2ecc71;
-                    }}
-                    .failure {{
-                        color: #e74c3c;
-                    }}
-                    pre {{
-                        background-color: #f8f8f8;
-                        border: 1px solid #ddd;
-                        border-radius: 4px;
-                        padding: 10px;
+                        padding: 14px 20px;
+                        background-color: #f5f7fa;
+                        border-bottom: 1px solid var(--border-color);
+                    }
+
+                    .tool-content {
+                        padding: 20px;
+                    }
+
+                    .success {
+                        color: var(--success-color);
+                        font-weight: 500;
+                    }
+
+                    .warning {
+                        color: var(--warning-color);
+                        font-weight: 500;
+                    }
+
+                    .failure {
+                        color: var(--danger-color);
+                        font-weight: 500;
+                    }
+
+                    pre {
+                        background-color: #f8f9fa;
+                        border: 1px solid var(--border-color);
+                        border-radius: 6px;
+                        padding: 16px;
                         overflow-x: auto;
-                    }}
-                    .executive-summary {{
-                        background-color: #f9f9f9;
-                        border-left: 4px solid #3498db;
-                        padding: 15px;
-                        margin-bottom: 20px;
-                    }}
-                    .action-plan {{
-                        background-color: #f0f8ff;
-                        border-left: 4px solid #27ae60;
-                        padding: 15px;
-                        margin-top: 20px;
-                    }}
-                    .tab {{
+                        font-family: 'Fira Code', 'JetBrains Mono', Menlo, Consolas, Monaco, monospace;
+                        font-size: 0.9rem;
+                        line-height: 1.6;
+                    }
+
+                    code {
+                        font-family: 'Fira Code', 'JetBrains Mono', Menlo, Consolas, Monaco, monospace;
+                        font-size: 0.9em;
+                        background-color: rgba(27,31,35,0.05);
+                        border-radius: 3px;
+                        padding: 0.2em 0.4em;
+                    }
+
+                    .executive-summary {
+                        background-color: #f8fafc;
+                        border-left: 4px solid var(--primary-color);
+                        padding: 20px;
+                        margin-bottom: 25px;
+                        border-radius: 0 var(--border-radius) var(--border-radius) 0;
+                        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+                    }
+
+                    .action-plan {
+                        background-color: #f0f8f7;
+                        border-left: 4px solid var(--accent-color);
+                        padding: 20px;
+                        margin: 25px 0;
+                        border-radius: 0 var(--border-radius) var(--border-radius) 0;
+                        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+                    }
+
+                    /* Modern tabs */
+                    .tab {
+                        display: flex;
                         overflow: hidden;
-                        border: 1px solid #ccc;
-                        background-color: #f1f1f1;
-                        border-radius: 8px 8px 0 0;
-                    }}
-                    .tab button {{
-                        background-color: inherit;
-                        float: left;
                         border: none;
+                        background-color: transparent;
+                        border-radius: var(--border-radius) var(--border-radius) 0 0;
+                        margin-bottom: -1px;
+                    }
+
+                    .tab button {
+                        background-color: #f5f7fa;
+                        border: 1px solid var(--border-color);
+                        border-bottom: none;
+                        border-radius: var(--border-radius) var(--border-radius) 0 0;
                         outline: none;
                         cursor: pointer;
-                        padding: 14px 16px;
-                        transition: 0.3s;
-                    }}
-                    .tab button:hover {{
-                        background-color: #ddd;
-                    }}
-                    .tab button.active {{
-                        background-color: #3498db;
-                        color: white;
-                    }}
-                    .tabcontent {{
+                        padding: 12px 18px;
+                        margin-right: 6px;
+                        transition: var(--transition);
+                        font-weight: 500;
+                        color: var(--text-light);
+                    }
+
+                    .tab button:hover {
+                        background-color: #fff;
+                        color: var(--primary-color);
+                    }
+
+                    .tab button.active {
+                        background-color: #fff;
+                        color: var(--primary-color);
+                        border-bottom: 2px solid var(--primary-color);
+                    }
+
+                    .tabcontent {
                         display: none;
-                        padding: 20px;
-                        border: 1px solid #ccc;
-                        border-top: none;
-                        border-radius: 0 0 8px 8px;
-                    }}
+                        padding: 24px;
+                        border: 1px solid var(--border-color);
+                        border-radius: 0 var(--border-radius) var(--border-radius) var(--border-radius);
+                        background-color: #fff;
+                        animation: fadeIn 0.3s ease;
+                    }
+
+                    @keyframes fadeIn {
+                        from { opacity: 0; }
+                        to { opacity: 1; }
+                    }
+
+                    .code-section {
+                        background-color: #f8f9fa;
+                        border: 1px solid var(--border-color);
+                        border-radius: var(--border-radius);
+                        padding: 16px;
+                        margin: 20px 0;
+                    }
+
+                    .code-header {
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        margin-bottom: 12px;
+                        padding-bottom: 10px;
+                        border-bottom: 1px solid var(--border-color);
+                        font-weight: 500;
+                    }
+
+                    /* Markdown styling improvements */
+                    .markdown-content {
+                        line-height: 1.8;
+                    }
+
+                    .markdown-content h1 {
+                        font-size: 2rem;
+                        border-bottom: 1px solid var(--border-color);
+                        padding-bottom: 0.5em;
+                        margin-bottom: 1em;
+                    }
+
+                    .markdown-content h2 {
+                        font-size: 1.6rem;
+                        border-bottom: 1px solid var(--border-color);
+                        padding-bottom: 0.4em;
+                        margin-bottom: 0.8em;
+                    }
+
+                    .markdown-content h3 {
+                        font-size: 1.3rem;
+                        margin-bottom: 0.7em;
+                    }
+
+                    .markdown-content h4 {
+                        font-size: 1.1rem;
+                        margin-bottom: 0.6em;
+                    }
+
+                    .markdown-content blockquote {
+                        border-left: 4px solid var(--primary-color);
+                        color: var(--text-light);
+                        margin: 1em 0;
+                        padding: 0.5em 1.2em;
+                        background-color: rgba(52, 152, 219, 0.05);
+                        border-radius: 0 var(--border-radius) var(--border-radius) 0;
+                    }
+
+                    .markdown-content table {
+                        border-collapse: collapse;
+                        width: 100%;
+                        margin: 1.5em 0;
+                        box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+                        border-radius: var(--border-radius);
+                        overflow: hidden;
+                    }
+
+                    .markdown-content table th {
+                        background-color: #f5f7fa;
+                        font-weight: 600;
+                        text-align: left;
+                        padding: 12px 15px;
+                        border: 1px solid var(--border-color);
+                    }
+
+                    .markdown-content table td {
+                        padding: 10px 15px;
+                        border: 1px solid var(--border-color);
+                    }
+
+                    .markdown-content table tr:nth-child(2n) {
+                        background-color: #f8f9fa;
+                    }
+
+                    .markdown-content table tr:hover {
+                        background-color: rgba(52, 152, 219, 0.05);
+                    }
+
+                    /* Button styles */
+                    .btn {
+                        display: inline-block;
+                        padding: 10px 16px;
+                        border-radius: var(--border-radius);
+                        font-weight: 500;
+                        text-decoration: none;
+                        cursor: pointer;
+                        transition: var(--transition);
+                        border: none;
+                        text-align: center;
+                    }
+
+                    .btn-primary {
+                        background-color: var(--primary-color);
+                        color: white;
+                    }
+
+                    .btn-primary:hover {
+                        background-color: var(--primary-dark);
+                        transform: translateY(-1px);
+                        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                    }
+
+                    .btn-secondary {
+                        background-color: #f5f7fa;
+                        color: var(--text-color);
+                        border: 1px solid var(--border-color);
+                    }
+
+                    .btn-secondary:hover {
+                        background-color: #e9ecef;
+                    }
+
+                    /* Card grid layout */
+                    .card-grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                        gap: 24px;
+                        margin: 20px 0;
+                    }
+
+                    /* Responsive design */
+                    @media (max-width: 768px) {
+                        header {
+                            padding: 20px;
+                        }
+                        
+                        h1 {
+                            font-size: 1.8rem;
+                        }
+                        
+                        h2 {
+                            font-size: 1.5rem;
+                        }
+                        
+                        .card-grid {
+                            grid-template-columns: 1fr;
+                        }
+                        
+                        .tab button {
+                            padding: 10px 14px;
+                            font-size: 0.9rem;
+                        }
+                    }
                 </style>
-            </head>
-            <body>
-                <header>
-                    <h1>Goal Execution Report</h1>
-                    <p>{goal_description}</p>
-                    <div>
-                        <strong>Goal ID:</strong> {goal_id} | 
-                        <strong>Execution:</strong> {timestamp} |
-                        <strong>Tools:</strong> {', '.join(tools_used)}
-                    </div>
-                </header>
-                
-                <div class="tab">
-                    <button class="tablinks active" onclick="openTab(event, 'Summary')">Executive Summary</button>
-                    <button class="tablinks" onclick="openTab(event, 'Execution')">Execution Details</button>
-                    <button class="tablinks" onclick="openTab(event, 'Analysis')">Analysis</button>
-                    <button class="tablinks" onclick="openTab(event, 'Action')">Action Plan</button>
-                </div>
-                
-                <div id="Summary" class="tabcontent" style="display: block;">
-                    <div class="executive-summary">
-                        {outputs.get('executive_summary', 'No summary available.').replace(NEW_LINE, '<br>')}
-                    </div>
-                </div>
-                
-                <div id="Execution" class="tabcontent">
-                    <h2>Tool Execution Details</h2>
             """
-            
+            html_content = f"""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Goal Execution Report: {goal_description}</title>
+                    <!-- Include the marked.js library from CDN -->
+                    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.2.1/marked.min.js"></script>
+                </head>
+                <body>
+                    {styles}
+                    <header>
+                        <h1>Goal Execution Report</h1>
+                        <p>{goal_description}</p>
+                        <div>
+                            <strong>Goal ID:</strong> {goal_id} | 
+                            <strong>Execution:</strong> {timestamp} |
+                            <strong>Tools:</strong> {', '.join(tools_used)}
+                        </div>
+                    </header>
+                    
+                    <div class="tab">
+                        <button class="tablinks active" onclick="openTab(event, 'Summary')">Executive Summary</button>
+                        <button class="tablinks" onclick="openTab(event, 'Execution')">Execution Details</button>
+                        <button class="tablinks" onclick="openTab(event, 'Code')">Code Documentation</button>
+                        <button class="tablinks" onclick="openTab(event, 'Analysis')">Analysis</button>
+                        <button class="tablinks" onclick="openTab(event, 'Action')">Action Plan</button>
+                    </div>
+                    
+                    <div id="Summary" class="tabcontent" style="display: block;">
+                        <div class="executive-summary markdown-content" id="executive-summary-content">
+                            {outputs.get('executive_summary', 'No summary available.')}
+                        </div>
+                    </div>
+                    
+                    <div id="Execution" class="tabcontent">
+                        <h2>Tool Execution Details</h2>
+                """
+                        
             # Add execution details
             for step in execution_summary:
                 tool_name = step['tool']
@@ -1456,20 +2342,20 @@ class AutonomousAgent:
                 status_icon = success_mark if success else failure_mark
                 
                 html_content += f"""
-                    <div class="tool-card">
-                        <div class="tool-header">
-                            <h3>{tool_name}</h3>
-                            <span class="{status_class}">{status_icon} {exec_time:.2f}s</span>
-                        </div>
-                        <div class="tool-content">
-                            <h4>Input:</h4>
-                            <pre>{json.dumps(step.get('input', {}), indent=2)}</pre>
+            <div class="tool-card">
+                <div class="tool-header">
+                    <h3>{tool_name}</h3>
+                    <span class="{status_class}">{status_icon} {exec_time:.2f}s</span>
+                </div>
+                <div class="tool-content">
+                    <h4>Input:</h4>
+                    <pre>{json.dumps(step.get('input', {}), indent=2)}</pre>
                 """
                 
                 if success:
                     html_content += f"""
-                            <h4>Result Preview:</h4>
-                            <pre>{step.get('result_snippet', 'No result')}</pre>
+                    <h4>Result Preview:</h4>
+                    <pre>{step.get('result_snippet', 'No result')}</pre>
                     """
                     
                     # Add link to full result file if result is large
@@ -1477,59 +2363,123 @@ class AutonomousAgent:
                     if isinstance(result, str) and len(result) > 1000:
                         result_filename = f"{tool_name.lower().replace(' ', '_')}_result.txt"
                         html_content += f"""
-                            <p><a href="{result_filename}" target="_blank">View Full Result</a></p>
+                    <p><a href="{result_filename}" target="_blank">View Full Result</a></p>
                         """
                 else:
                     html_content += f"""
-                            <h4>Error:</h4>
-                            <pre class="failure">{step.get('error', 'Unknown error')}</pre>
+                    <h4>Error:</h4>
+                    <pre class="failure">{step.get('error', 'Unknown error')}</pre>
                     """
                     
                 html_content += """
-                        </div>
-                    </div>
+                </div>
+            </div>
                 """
                 
+            # Add code documentation tab if available
+            html_content += """
+        </div>
+        """
+            
+            if outputs and 'documentation' in outputs:
+                html_content += f"""
+        <div id="Code" class="tabcontent">
+            <h2>Code Documentation</h2>
+            <div class="code-section markdown-content" id="documentation-content">
+                {outputs.get('documentation', '')}
+            </div>
+                """
+                
+                if 'complete_solution' in outputs and outputs['complete_solution']:
+                    solution_filename = f"goal_{goal_id}_solution.py"
+                    html_content += f"""
+            <div class="code-header">
+                <h3>Complete Solution</h3>
+                <a href="{solution_filename}" download>Download Solution</a>
+            </div>
+            <div class="markdown-content" id="complete-solution-content">
+                {outputs.get('complete_solution', '')}
+            </div>
+            <p><a href="{solution_filename}">View Full Solution</a></p>
+                    """
+                    
+                if 'usage_examples' in outputs and outputs['usage_examples']:
+                    examples_filename = f"goal_{goal_id}_examples.py"
+                    html_content += f"""
+            <div class="code-header">
+                <h3>Usage Examples</h3>
+                <a href="{examples_filename}" download>Download Examples</a>
+            </div>
+            <div class="markdown-content" id="usage-examples-content">
+                {outputs.get('usage_examples', '')}
+            </div>
+            <p><a href="{examples_filename}">View Full Examples</a></p>
+                    """
+                    
+                if 'code_analysis' in outputs and outputs['code_analysis']:
+                    html_content += f"""
+            <h3>Code Quality Analysis</h3>
+            <div class="code-section markdown-content" id="code-analysis-content">
+                {outputs.get('code_analysis', '')}
+            </div>
+                    """
+                    
+                html_content += """
+        </div>
+                """
+            functions = """
+                 function openTab(evt, tabName) {{
+            var i, tabcontent, tablinks;
+            tabcontent = document.getElementsByClassName("tabcontent");
+            for (i = 0; i < tabcontent.length; i++) {{
+                tabcontent[i].style.display = "none";
+            }}
+            tablinks = document.getElementsByClassName("tablinks");
+            for (i = 0; i < tablinks.length; i++) {{
+                tablinks[i].className = tablinks[i].className.replace(" active", "");
+            }}
+            document.getElementById(tabName).style.display = "block";
+            evt.currentTarget.className += " active";
+        }}
+        
+        // Parse all markdown content on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            // Get all elements with markdown content
+            const markdownElements = document.querySelectorAll('.markdown-content');
+            
+            // Render markdown content for each element
+            markdownElements.forEach(function(element) {
+                const rawContent = element.textContent || element.innerText;
+                element.innerHTML = marked.parse(rawContent);
+            });
+        });
+            """
             # Add analysis tab content
             html_content += f"""
-                </div>
-                
-                <div id="Analysis" class="tabcontent">
-                    <h2>Detailed Analysis</h2>
-                    <div>
-                        {outputs.get('detailed_analysis', 'No analysis available.').replace(NEW_LINE, '<br>')}
-                    </div>
-                    
-                    <h2>Visualization Opportunities</h2>
-                    <div>
-                        {outputs.get('visualization_recommendations', 'No recommendations available.').replace(NEW_LINE, '<br>')}
-                    </div>
-                </div>
-                
-                <div id="Action" class="tabcontent">
-                    <h2>Recommended Action Plan</h2>
-                    <div class="action-plan">
-                        {outputs.get('action_plan', 'No action plan available.').replace(NEW_LINE, '<br>')}
-                    </div>
-                </div>
-                
-                <script>
-                function openTab(evt, tabName) {{
-                    var i, tabcontent, tablinks;
-                    tabcontent = document.getElementsByClassName("tabcontent");
-                    for (i = 0; i < tabcontent.length; i++) {{
-                        tabcontent[i].style.display = "none";
-                    }}
-                    tablinks = document.getElementsByClassName("tablinks");
-                    for (i = 0; i < tablinks.length; i++) {{
-                        tablinks[i].className = tablinks[i].className.replace(" active", "");
-                    }}
-                    document.getElementById(tabName).style.display = "block";
-                    evt.currentTarget.className += " active";
-                }}
-                </script>
-            </body>
-            </html>
+        <div id="Analysis" class="tabcontent">
+            <h2>Detailed Analysis</h2>
+            <div class="markdown-content" id="detailed-analysis-content">
+                {outputs.get('detailed_analysis', 'No analysis available.')}
+            </div>
+            
+            <h2>Visualization Opportunities</h2>
+            <div class="markdown-content" id="visualization-recommendations-content">
+                {outputs.get('visualization_recommendations', 'No recommendations available.')}
+            </div>
+        </div>
+        
+        <div id="Action" class="tabcontent">
+            <h2>Recommended Action Plan</h2>
+            <div class="action-plan markdown-content" id="action-plan-content">
+                {outputs.get('action_plan', 'No action plan available.')}
+            </div>
+        </div>
+        
+        <script>
+            {functions}
+        </script>
+    </body>
+    </html>
             """
             
             # Save the HTML report - ADD UTF-8 ENCODING HERE
@@ -1553,6 +2503,7 @@ class AutonomousAgent:
     ## Quick Access
     - For a quick overview: Open the HTML report and check the Executive Summary tab
     - For technical details: See the Execution Details tab in the HTML report
+    - For code documentation: Check the Code Documentation tab
     - For recommended next steps: Check the Action Plan tab
 
     ## Additional Resources
@@ -1560,6 +2511,15 @@ class AutonomousAgent:
             # Add links to any extra files
             if outputs and 'structured_data' in outputs:
                 readme_content += f"- **[{json_filename}](./{json_filename})** - Structured data in JSON format{NEW_LINE}"
+                
+            # Add code solution files if available
+            if outputs and 'complete_solution' in outputs and outputs['complete_solution']:
+                solution_filename = f"goal_{goal_id}_solution.py"
+                readme_content += f"- **[{solution_filename}](./{solution_filename})** - Complete implementation{NEW_LINE}"
+                
+            if outputs and 'usage_examples' in outputs and outputs['usage_examples']:
+                examples_filename = f"goal_{goal_id}_examples.py"
+                readme_content += f"- **[{examples_filename}](./{examples_filename})** - Usage examples{NEW_LINE}"
                 
             for tool_name in results:
                 result = results.get(tool_name, '')
@@ -1605,21 +2565,21 @@ class AutonomousAgent:
             result_id = f"goal_result_{goal['id']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
             # Create metadata
-            metadata = {
-                "type": "goal_execution",
-                "goal_id": goal['id'],
-                "goal_description": goal['description'],
-                "tools_used": tools_used,
-                "timestamp": datetime.now().isoformat(),
-                "success": True,  # Assuming success if we get here
-                "output_types": list(outputs.keys()) if outputs else []
-            }
+            # metadata = {
+            #     "type": "goal_execution",
+            #     "goal_id": goal['id'],
+            #     "goal_description": goal['description'],
+            #     "tools_used": tools_used,
+            #     "timestamp": datetime.now().isoformat(),
+            #     "success": True,  # Assuming success if we get here
+            #     "output_types": list(outputs.keys()) if outputs else []
+            # }
             
             # Store in vector database
             self.core_collection.add(
                 ids=[result_id],
                 embeddings=embeddings,
-                metadatas=[metadata]
+                # metadatas=[metadata]
             )
             
             # Add to execution history in memory with enhanced tracking
@@ -1629,7 +2589,7 @@ class AutonomousAgent:
                 "tools_used": tools_used,
                 "summary": execution_summary,
                 "result_id": result_id,
-                "output_location": metadata.get("output_location", ""),
+                # "output_location": metadata.get("output_location", ""),
                 "performance_metrics": {
                     "total_execution_time": sum(step.get("execution_time", 0) for step in execution_summary),
                     "tool_count": len(tools_used),
@@ -2339,7 +3299,7 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, required=True, help='The main objective for the agent')
     parser.add_argument('--max_iterations', type=int, default=5, help='Maximum number of iterations')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    
+
     args = parser.parse_args()
     
     agent = AutonomousAgent(

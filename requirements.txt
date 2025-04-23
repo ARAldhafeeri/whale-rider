@@ -17,3 +17,5 @@ duckduckgo_search==8.0.1
 
 # OpenAI
 openai==1.75.0
+
+markdown=2.5.3

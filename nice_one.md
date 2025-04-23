@@ -1,1 +1,0 @@
-python agent.py --objective " You are helpful assistance , I want to focus on full-stack development freelance in your workspace try to dump anything that helps me to acuire new clients, templates and means of securing and getting the contracts " --max_iterations 50 --verbose
