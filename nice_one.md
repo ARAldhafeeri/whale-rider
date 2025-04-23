@@ -1,1 +1,1 @@
-python agent.py --objective " Your are helpful agent, your task is to create road map for saas founder to take any saas from 0 to 10k " --max_iterations 50 --verbose
+python agent.py --objective " You are helpful assistance , I want to focus on full-stack development freelance in your workspace try to dump anything that helps me to acuire new clients, templates and means of securing and getting the contracts " --max_iterations 50 --verbose

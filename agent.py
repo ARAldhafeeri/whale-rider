@@ -39,6 +39,12 @@ def id_generator(size=6, chars=string.ascii_uppercase + string.digits):
 
 load_dotenv()
 
+# CMD styling :
+BOLD = "\033[1m"
+BLUE = "\033[94m"
+RESET = ""
+CYAN = "\033[36m"
+NEW_LINE = "\n"
 # Base Tool Inputs
 class WebSearchInput(BaseModel):
     query: str = Field(description="Search query for web search")
@@ -820,27 +826,33 @@ class AutonomousAgent:
             recommended_tools = self.recommend_tools(goal_description)
             
             # TODO: If no specific tools recommended, use all available
-            if not recommended_tools:
-                self.log("No specific tools recommended, using general approach", "WARNING")
-                return self._execute_goal_with_agent(goal)
+            # if not recommended_tools:
+            #     self.log("No specific tools recommended, using general approach", "WARNING")
+            #     return self._execute_goal_with_agent(goal)
             
             # Color mapping for tool outputs
             colors = {
-                "web_search": "\033[94m",      # Blue
-                "web_scrape": "\033[96m",      # Cyan
-                "file_operations": "\033[92m",  # Green
-                "run_os_command": "\033[91m",   # Red
-                "math_calculation": "\033[95m", # Magenta
-                "execute_python": "\033[93m",   # Yellow
-                "system_info": "\033[97m",      # White
-                "read_directory": "\033[90m",   # Gray
-                "create_documentation": "\033[92m", # Green
+                "web_search": "\033[1;94m",      # Bold Blue
+                "web_scrape": "\033[1;96m",      # Bold Cyan
+                "file_operations": "\033[1;92m",  # Bold Green
+                "run_os_command": "\033[1;91m",   # Bold Red
+                "math_calculation": "\033[1;95m", # Bold Magenta
+                "execute_python": "\033[1;93m",   # Bold Yellow
+                "system_info": "\033[1;97m",      # Bold White
+                "read_directory": "\033[1;90m",   # Bold Gray
+                "create_documentation": "\033[1;92m", # Bold Green
             }
-            default_color = "\033[0m"  # Reset color
+            default_color = ""  # Reset color
+            
+            # Initialize rich display elements
+            print(f"\n{'='*80}")
+            print(f"🚀 \033[1;97mEXECUTING GOAL: {goal_description}")
+            print(f"{'='*80}\n")
             
             # Execute each recommended tool in sequence
             results = {}
             execution_summary = []
+            all_raw_outputs = {}  # Store complete outputs
             
             self.log(f"Executing goal with {len(recommended_tools)} tools: {', '.join(recommended_tools)}", "INFO")
             
@@ -874,17 +886,22 @@ class AutonomousAgent:
                     self.log(f"Tool '{tool_name}' not found, skipping", "WARNING")
                     continue
                     
-                # Display progress
+                # Display progress with enhanced visuals
                 completed_tools += 1
                 progress_pct = (completed_tools / total_tools) * 100
-                self.log(f"[{completed_tools}/{total_tools}] ({progress_pct:.1f}%) Running tool: {tool_name}", "INFO")
+                progress_bar = "█" * int(progress_pct / 5) + "░" * (20 - int(progress_pct / 5))
+                
+                print(f"\n{BOLD}[{completed_tools}/{total_tools}] ({progress_pct:.1f}%)")
+                print(f"📊 \033[1;36mProgress: |{progress_bar}|")
+                print(f"🔧 {BOLD}Running tool: \033[1;93m{tool_name}")
                 
                 # Generate input for this tool based on previous results
                 tool_input = self._generate_tool_input(tool, goal_description, results)
                 
-                # Execute the tool with color coding
+                # Execute the tool with enhanced visual display
                 color = colors.get(tool_name, default_color)
-                print(f"\n{color}[TOOL EXECUTION]: {tool_name}{default_color}")
+                print(f"\n{color}🔄 EXECUTING: {tool_name}{default_color}")
+                print(f"{color}{'▼'*50}{default_color}")
                 
                 # Execute and capture result
                 start_time = time.time()
@@ -894,6 +911,7 @@ class AutonomousAgent:
                     
                     # Store result
                     results[tool_name] = result
+                    all_raw_outputs[tool_name] = result
                     
                     # Add to summary
                     execution_summary.append({
@@ -901,11 +919,16 @@ class AutonomousAgent:
                         "input": tool_input,
                         "success": True,
                         "execution_time": execution_time,
-                        "result_snippet": result[:200] + "..." if len(result) > 200 else result
+                        "result_snippet": result[:300] if isinstance(result, str) else str(result)[:300]
                     })
                     
-                    # Display colored output
-                    print(f"{color}[RESULT PREVIEW]: {result[:300]}...{default_color}" if len(result) > 300 else f"{color}[RESULT]: {result}{default_color}")
+                    # Display colored preview with enhanced formatting
+                    result_preview = result[:300] + "..." if isinstance(result, str) and len(result) > 300 else result
+                    print(f"{color}✓ SUCCESS [{execution_time:.2f}s]{default_color}")
+                    print(f"{color}📋 RESULT PREVIEW:{default_color}")
+                    print(f"{color}{'-'*50}{default_color}")
+                    print(f"{color}{result_preview}{default_color}")
+                    print(f"{color}{'-'*50}{default_color}")
                     
                 except Exception as e:
                     execution_time = time.time() - start_time
@@ -920,14 +943,26 @@ class AutonomousAgent:
                         "execution_time": execution_time,
                         "error": str(e)
                     })
+                    
+                    # Display error
+                    print(f"\033[91m❌ FAILED [{execution_time:.2f}s]: {str(e)}")
             
-            # Generate documentation after all tools are executed
-            self._create_execution_documentation(goal, recommended_tools, execution_summary, results)
+            # Generate multi-format outputs after all tools are executed
+            outputs = self._generate_comprehensive_outputs(goal, recommended_tools, execution_summary, results, all_raw_outputs)
+            
+            # Create documentation
+            self._create_execution_documentation(goal, recommended_tools, execution_summary, results, outputs)
             
             # Store results in memory
-            self._store_goal_results(goal, recommended_tools, results, execution_summary)
+            self._store_goal_results(goal, recommended_tools, results, execution_summary, outputs)
             
-            return True
+            # Display completion message
+            print(f"\n{'='*80}")
+            print(f"✅ \033[1;92mGOAL EXECUTION COMPLETE")
+            print(f"📁 {BOLD}Outputs generated: {', '.join(outputs.keys())}")
+            print(f"{'='*80}\n")
+            
+            return outputs
         except Exception as e:
             self.log_error(f"Goal execution failed: {str(e)}")
             return False
@@ -1045,33 +1080,201 @@ class AutonomousAgent:
         except Exception as e:
             raise Exception(f"Tool execution error: {str(e)}")
 
-    def _create_execution_documentation(self, goal, tools_used, execution_summary, results):
-        """Create detailed documentation of the goal execution"""
+    def _generate_comprehensive_outputs(self, goal, tools_used, execution_summary, results, raw_outputs):
+        """Generate comprehensive outputs in multiple formats based on tool execution results"""
         try:
-            # Prepare the documentation content
-            doc_content = f"""# Goal Execution Report: {goal['description']}
+            outputs = {}
+            goal_description = goal.get("description", "No description provided")
+            
+            # 1. Generate executive summary
+            prompt_exec_summary = PromptTemplate(template="""
+            Based on the results of these tool executions:
+            {results_summary}
+            
+            For this goal: {goal_description}
+            
+            Please provide a concise executive summary (3-5 paragraphs) that highlights:
+            1. What was accomplished
+            2. Key findings and insights
+            3. Whether the goal was successfully completed
+            4. Next steps or recommendations
+            
+            Format as Markdown with clear headings.
+            """)
+            
+            # Format results summary for the prompt
+            results_summary = ""
+            for tool, result in results.items():
+                results_summary += f"\n--- {tool} RESULT ---\n"
+                result_text = result[:500] + "..." if isinstance(result, str) and len(result) > 500 else str(result)
+                results_summary += result_text
+            
+            # Generate executive summary
+            exec_summary_chain = prompt_exec_summary | self.llm | StrOutputParser()
+            executive_summary = exec_summary_chain.invoke({
+                "results_summary": results_summary,
+                "goal_description": goal_description
+            })
+            outputs["executive_summary"] = executive_summary
+            
+            # 2. Generate detailed analysis
+            prompt_detailed = PromptTemplate(template="""
+            Based on the complete results of these tool executions:
+            {full_results}
+            
+            For this goal: {goal_description}
+            
+            Please provide a comprehensive analysis that includes:
+            1. Detailed breakdown of each tool's findings
+            2. Patterns, insights, and connections between different results
+            3. Critical analysis of the information gathered
+            4. Limitations of the current approach and potential blind spots
+            5. Actionable recommendations with justifications
+            
+            Format as a professional Markdown document with clear sections, bullet points, and emphasis where appropriate.
+            """)
+            
+            # Format full results for the prompt
+            full_results = ""
+            for tool, result in raw_outputs.items():
+                full_results += f"\n\n## {tool.upper()} RESULTS\n\n"
+                result_text = result if isinstance(result, str) else str(result)
+                full_results += result_text
+            
+            # Generate detailed analysis
+            detailed_chain = prompt_detailed | self.llm | StrOutputParser()
+            detailed_analysis = detailed_chain.invoke({
+                "full_results": full_results,
+                "goal_description": goal_description
+            })
+            outputs["detailed_analysis"] = detailed_analysis
+            
+            # 3. Generate visualizations summary (instruction for visualization creation)
+            prompt_visuals = PromptTemplate(template="""
+            Based on the results of these tool executions:
+            {results_summary}
+            
+            For this goal: {goal_description}
+            
+            Identify what data from the results would be valuable to visualize.
+            For each visualization opportunity:
+            1. Describe what data should be visualized
+            2. Suggest the appropriate visualization type (bar chart, line graph, etc.)
+            3. Explain what insights this visualization would reveal
+            
+            Format as Markdown with a clear section for each recommended visualization.
+            """)
+            
+            # Generate visualization recommendations
+            visuals_chain = prompt_visuals | self.llm | StrOutputParser()
+            visualization_summary = visuals_chain.invoke({
+                "results_summary": results_summary,
+                "goal_description": goal_description
+            })
+            outputs["visualization_recommendations"] = visualization_summary
+            
+            # 4. Generate action plan
+            prompt_action = PromptTemplate(template="""
+            Based on the analysis of the tool execution results:
+            {executive_summary}
+            
+            For this goal: {goal_description}
+            
+            Please provide a specific, actionable plan that includes:
+            1. Clear next steps with priorities
+            2. Required resources or information for each step
+            3. Potential challenges and how to overcome them
+            4. Success metrics to evaluate progress
+            
+            Format as a structured action plan in Markdown with numbered steps and clear headings.
+            """)
+            
+            # Generate action plan
+            action_chain = prompt_action | self.llm | StrOutputParser()
+            action_plan = action_chain.invoke({
+                "executive_summary": executive_summary,
+                "goal_description": goal_description
+            })
+            outputs["action_plan"] = action_plan
+            
+            # 5. Generate exportable data in structured format if applicable
+            # Look for data that could be structured (e.g., from web scraping, system info)
+            has_structured_data = any(tool in raw_outputs for tool in ["web_scrape", "system_info", "read_directory"])
+            if has_structured_data:
+                prompt_structured = PromptTemplate(template="""
+                From these tool execution results:
+                {full_results}
+                
+                Extract all structured data into a well-formatted JSON structure.
+                Focus on organizing key-value pairs, lists, and nested data in a clean, consistent format.
+                Include only the actual data, not explanations or context.
+                """)
+                
+                # Generate structured data
+                structured_chain = prompt_structured | self.llm | StrOutputParser()
+                try:
+                    structured_data = structured_chain.invoke({
+                        "full_results": full_results
+                    })
+                    
+                    # Try to parse and validate as JSON
+                    try:
+                        json_data = json.loads(structured_data)
+                        # If successful, convert back to pretty JSON string
+                        outputs["structured_data"] = json.dumps(json_data, indent=2)
+                    except:
+                        # If failed, still store the output but mark as unvalidated
+                        outputs["structured_data"] = structured_data
+                except Exception as e:
+                    self.log(f"Error generating structured data: {str(e)}", "WARNING")
+            
+            return outputs
+        
+        except Exception as e:
+            self.log(f"Error generating comprehensive outputs: {str(e)}", "ERROR")
+            return {"error": str(e)}
+
+    def _create_execution_documentation(self, goal, tools_used, execution_summary, results, outputs=None):
+        """Create detailed documentation of the goal execution with proper encoding"""
+        try:
+            goal_description = goal.get("description", "No description provided")
+            goal_id = goal.get("id", 0)
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            date_simple = datetime.now().strftime('%Y%m%d')
+            
+            # Create a uniquely named folder for this goal's outputs
+            doc_folder = f"goal_{goal_id}_{date_simple}"
+            os.makedirs(f"./workspace/{doc_folder}", exist_ok=True)
+            
+            # Replace Unicode emoji with ASCII alternatives to avoid encoding issues
+            success_mark = "✓" # Replace with "(Success)" if encoding issues persist
+            failure_mark = "✗" # Replace with "(Failed)" if encoding issues persist
+
+            # 1. Main markdown report with comprehensive info
+            doc_content = f"""# Goal Execution Report: {goal_description}
 
     ## Overview
-    - **Goal ID:** {goal['id']}
+    - **Goal ID:** {goal_id}
     - **Status:** Completed
-    - **Execution Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    - **Execution Time:** {timestamp}
+    - **Tools Used:** {', '.join(tools_used)}
 
-    ## Tools Used
-    {', '.join(tools_used)}
+    ## Executive Summary
+    {outputs.get('executive_summary', 'No summary available.')}
 
-    ## Execution Summary
+    ## Execution Details
     """
             
-            # Add detailed execution information
+            # Add detailed execution information with enhanced formatting
             for step in execution_summary:
                 tool_name = step['tool']
-                success = "✅ Success" if step.get('success', False) else "❌ Failed"
+                success = f"{success_mark} Success" if step.get('success', False) else f"{failure_mark} Failed"
                 exec_time = f"{step.get('execution_time', 0):.2f}s"
                 
-                doc_content += f"\n### {tool_name} ({success}, {exec_time})\n"
+                doc_content += f"{NEW_LINE}### {tool_name} ({success}, {exec_time}){NEW_LINE}"
                 
                 # Add input used
-                doc_content += "\n**Input:**\n```\n"
+                doc_content += "\n**Input:**\n```json\n"
                 doc_content += json.dumps(step.get('input', {}), indent=2)
                 doc_content += "\n```\n"
                 
@@ -1081,101 +1284,380 @@ class AutonomousAgent:
                     result_preview = step.get('result_snippet', 'No result')
                     doc_content += result_preview
                     doc_content += "\n```\n"
+                    
+                    # Add link to full result file if result is large
+                    if tool_name != "web_scrape":
+                        result = results.get(tool_name, '')
+                        if isinstance(result, str) and len(result) > 1000:
+                            # Save full result to separate file
+                            result_filename = f"{tool_name.lower().replace(' ', '_')}_result.txt"
+                            with open(f"./workspace/{doc_folder}/{result_filename}", "w", encoding="utf-8") as f:
+                                f.write(result)
+                            doc_content += f"{NEW_LINE}[View Full Result](./{result_filename}){NEW_LINE}"
                 else:
-                    doc_content += f"\n**Error:** {step.get('error', 'Unknown error')}\n"
+                    doc_content += f"{NEW_LINE}**Error:** {step.get('error', 'Unknown error')}{NEW_LINE}"
             
-            # Add conclusions
-            prompt = PromptTemplate(template="""
-            Based on the results of these tool executions:
-            {results}
+            # Add detailed analysis
+            if outputs and 'detailed_analysis' in outputs:
+                doc_content += "\n## Detailed Analysis\n"
+                doc_content += outputs['detailed_analysis']
             
-            For this goal: {goal_description}
+            # Add visualization recommendations
+            if outputs and 'visualization_recommendations' in outputs:
+                doc_content += "\n## Visualization Opportunities\n"
+                doc_content += outputs['visualization_recommendations']
             
-            Please provide:
-            1. A detailed summary of findings
-            2. Key insights gained
-            3. Whether the goal appears to be successfully completed
-            4. Any recommendations for follow-up actions
+            # Add action plan
+            if outputs and 'action_plan' in outputs:
+                doc_content += "\n## Recommended Action Plan\n"
+                doc_content += outputs['action_plan']
+                
+            # Save the main documentation file - ADD UTF-8 ENCODING HERE
+            main_doc_filename = f"goal_{goal_id}_{date_simple}_report.md"
+            with open(f"./workspace/{doc_folder}/{main_doc_filename}", "w", encoding="utf-8") as f:
+                f.write(doc_content)
+                
+            # 2. Create an HTML report for interactive viewing
+            # Replace emojis with ASCII alternatives for HTML as well
+            html_content = f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Goal Execution Report: {goal_description}</title>
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        line-height: 1.6;
+                        color: #333;
+                        max-width: 1200px;
+                        margin: 0 auto;
+                        padding: 20px;
+                    }}
+                    header {{
+                        background: linear-gradient(135deg, #2c3e50, #4ca1af);
+                        color: white;
+                        padding: 20px;
+                        border-radius: 8px;
+                        margin-bottom: 20px;
+                        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                    }}
+                    h1, h2, h3, h4 {{
+                        color: #2c3e50;
+                    }}
+                    .tool-card {{
+                        border: 1px solid #ddd;
+                        border-radius: 8px;
+                        margin-bottom: 20px;
+                        overflow: hidden;
+                    }}
+                    .tool-header {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;
+                        padding: 10px 15px;
+                        background-color: #f5f5f5;
+                        border-bottom: 1px solid #ddd;
+                    }}
+                    .tool-content {{
+                        padding: 15px;
+                    }}
+                    .success {{
+                        color: #2ecc71;
+                    }}
+                    .failure {{
+                        color: #e74c3c;
+                    }}
+                    pre {{
+                        background-color: #f8f8f8;
+                        border: 1px solid #ddd;
+                        border-radius: 4px;
+                        padding: 10px;
+                        overflow-x: auto;
+                    }}
+                    .executive-summary {{
+                        background-color: #f9f9f9;
+                        border-left: 4px solid #3498db;
+                        padding: 15px;
+                        margin-bottom: 20px;
+                    }}
+                    .action-plan {{
+                        background-color: #f0f8ff;
+                        border-left: 4px solid #27ae60;
+                        padding: 15px;
+                        margin-top: 20px;
+                    }}
+                    .tab {{
+                        overflow: hidden;
+                        border: 1px solid #ccc;
+                        background-color: #f1f1f1;
+                        border-radius: 8px 8px 0 0;
+                    }}
+                    .tab button {{
+                        background-color: inherit;
+                        float: left;
+                        border: none;
+                        outline: none;
+                        cursor: pointer;
+                        padding: 14px 16px;
+                        transition: 0.3s;
+                    }}
+                    .tab button:hover {{
+                        background-color: #ddd;
+                    }}
+                    .tab button.active {{
+                        background-color: #3498db;
+                        color: white;
+                    }}
+                    .tabcontent {{
+                        display: none;
+                        padding: 20px;
+                        border: 1px solid #ccc;
+                        border-top: none;
+                        border-radius: 0 0 8px 8px;
+                    }}
+                </style>
+            </head>
+            <body>
+                <header>
+                    <h1>Goal Execution Report</h1>
+                    <p>{goal_description}</p>
+                    <div>
+                        <strong>Goal ID:</strong> {goal_id} | 
+                        <strong>Execution:</strong> {timestamp} |
+                        <strong>Tools:</strong> {', '.join(tools_used)}
+                    </div>
+                </header>
+                
+                <div class="tab">
+                    <button class="tablinks active" onclick="openTab(event, 'Summary')">Executive Summary</button>
+                    <button class="tablinks" onclick="openTab(event, 'Execution')">Execution Details</button>
+                    <button class="tablinks" onclick="openTab(event, 'Analysis')">Analysis</button>
+                    <button class="tablinks" onclick="openTab(event, 'Action')">Action Plan</button>
+                </div>
+                
+                <div id="Summary" class="tabcontent" style="display: block;">
+                    <div class="executive-summary">
+                        {outputs.get('executive_summary', 'No summary available.').replace(NEW_LINE, '<br>')}
+                    </div>
+                </div>
+                
+                <div id="Execution" class="tabcontent">
+                    <h2>Tool Execution Details</h2>
+            """
             
-            Format as Markdown.
-            """)
+            # Add execution details
+            for step in execution_summary:
+                tool_name = step['tool']
+                success = step.get('success', False)
+                exec_time = step.get('execution_time', 0)
+                status_class = "success" if success else "failure"
+                status_icon = success_mark if success else failure_mark
+                
+                html_content += f"""
+                    <div class="tool-card">
+                        <div class="tool-header">
+                            <h3>{tool_name}</h3>
+                            <span class="{status_class}">{status_icon} {exec_time:.2f}s</span>
+                        </div>
+                        <div class="tool-content">
+                            <h4>Input:</h4>
+                            <pre>{json.dumps(step.get('input', {}), indent=2)}</pre>
+                """
+                
+                if success:
+                    html_content += f"""
+                            <h4>Result Preview:</h4>
+                            <pre>{step.get('result_snippet', 'No result')}</pre>
+                    """
+                    
+                    # Add link to full result file if result is large
+                    result = results.get(tool_name, '')
+                    if isinstance(result, str) and len(result) > 1000:
+                        result_filename = f"{tool_name.lower().replace(' ', '_')}_result.txt"
+                        html_content += f"""
+                            <p><a href="{result_filename}" target="_blank">View Full Result</a></p>
+                        """
+                else:
+                    html_content += f"""
+                            <h4>Error:</h4>
+                            <pre class="failure">{step.get('error', 'Unknown error')}</pre>
+                    """
+                    
+                html_content += """
+                        </div>
+                    </div>
+                """
+                
+            # Add analysis tab content
+            html_content += f"""
+                </div>
+                
+                <div id="Analysis" class="tabcontent">
+                    <h2>Detailed Analysis</h2>
+                    <div>
+                        {outputs.get('detailed_analysis', 'No analysis available.').replace(NEW_LINE, '<br>')}
+                    </div>
+                    
+                    <h2>Visualization Opportunities</h2>
+                    <div>
+                        {outputs.get('visualization_recommendations', 'No recommendations available.').replace(NEW_LINE, '<br>')}
+                    </div>
+                </div>
+                
+                <div id="Action" class="tabcontent">
+                    <h2>Recommended Action Plan</h2>
+                    <div class="action-plan">
+                        {outputs.get('action_plan', 'No action plan available.').replace(NEW_LINE, '<br>')}
+                    </div>
+                </div>
+                
+                <script>
+                function openTab(evt, tabName) {{
+                    var i, tabcontent, tablinks;
+                    tabcontent = document.getElementsByClassName("tabcontent");
+                    for (i = 0; i < tabcontent.length; i++) {{
+                        tabcontent[i].style.display = "none";
+                    }}
+                    tablinks = document.getElementsByClassName("tablinks");
+                    for (i = 0; i < tablinks.length; i++) {{
+                        tablinks[i].className = tablinks[i].className.replace(" active", "");
+                    }}
+                    document.getElementById(tabName).style.display = "block";
+                    evt.currentTarget.className += " active";
+                }}
+                </script>
+            </body>
+            </html>
+            """
             
-            # Format results for the conclusion generator
-            results_formatted = ""
-            for tool, result in results.items():
-                results_formatted += f"\n--- {tool} RESULT ---\n"
-                results_formatted += f"{result[:1000]}..." if len(result) > 1000 else result
+            # Save the HTML report - ADD UTF-8 ENCODING HERE
+            html_filename = f"goal_{goal_id}_{date_simple}_report.html"
+            with open(f"./workspace/{doc_folder}/{html_filename}", "w", encoding="utf-8") as f:
+                f.write(html_content)
+                
+            # 3. Save structured data as JSON if available
+            if outputs and 'structured_data' in outputs:
+                json_filename = f"goal_{goal_id}_{date_simple}_data.json"
+                with open(f"./workspace/{doc_folder}/{json_filename}", "w", encoding="utf-8") as f:
+                    f.write(outputs['structured_data'])
             
-            # Generate conclusion
-            conclusion_chain = prompt | self.llm | StrOutputParser()
-            conclusion = conclusion_chain.invoke({
-                "results": results_formatted,
-                "goal_description": goal['description']
-            })
+            # 4. Create a simple README to guide users through the outputs
+            readme_content = f"""# Goal Execution: {goal_description}
+
+    ## Available Files
+    - **[{main_doc_filename}](./{main_doc_filename})** - Comprehensive Markdown report with all details
+    - **[{html_filename}](./{html_filename})** - Interactive HTML report with tabbed interface
+
+    ## Quick Access
+    - For a quick overview: Open the HTML report and check the Executive Summary tab
+    - For technical details: See the Execution Details tab in the HTML report
+    - For recommended next steps: Check the Action Plan tab
+
+    ## Additional Resources
+    """
+            # Add links to any extra files
+            if outputs and 'structured_data' in outputs:
+                readme_content += f"- **[{json_filename}](./{json_filename})** - Structured data in JSON format{NEW_LINE}"
+                
+            for tool_name in results:
+                result = results.get(tool_name, '')
+                if isinstance(result, str) and len(result) > 1000:
+                    result_filename = f"{tool_name.lower().replace(' ', '_')}_result.txt"
+                    readme_content += f"- **[{result_filename}](./{result_filename})** - Full results from {tool_name}{NEW_LINE}"
             
-            # Add conclusion to documentation
-            doc_content += "\n## Conclusions\n"
-            doc_content += conclusion
+            # Save the README - ADD UTF-8 ENCODING HERE
+            with open(f"./workspace/{doc_folder}/README.md", "w", encoding="utf-8") as f:
+                f.write(readme_content)
             
-            # Create the documentation file
-            doc_filename = f"goal_{goal['id']}_{datetime.now().strftime('%Y%m%d')}_execution.md"
-            self.execute_tool_manually("create_documentation", {
-                "prefix": "execution_",
-                "filename": doc_filename,
-                "content": doc_content
-            })
-            
-            self.log(f"Created execution documentation: {doc_filename}", "INFO")
+            # Log success
+            self.log(f"Created comprehensive execution documentation in workspace/{doc_folder}/", "INFO")
+            return f"workspace/{doc_folder}/"
             
         except Exception as e:
-            self.log(f"Error creating execution documentation: {str(e)}", "ERROR")   
+            self.log(f"Error creating execution documentation: {str(e)}", "ERROR")
+            return None
 
-
-    def _store_goal_results(self, goal, tools_used, results, execution_summary):
-        """Store goal execution results in vector memory for future reference"""
+    def _store_goal_results(self, goal, tools_used, results, execution_summary, outputs=None):
+        """Store goal execution results in vector memory with enhanced metadata for future reference"""
         try:
             # Create a combined result text for embedding
-            combined_text = f"Goal: {goal['description']}\n\nTools used: {', '.join(tools_used)}\n\n"
+            combined_text = f"Goal: {goal['description']}{NEW_LINE}{NEW_LINE}Tools used: {', '.join(tools_used)}{NEW_LINE}{NEW_LINE}"
             
+            # Add executive summary if available
+            if outputs and 'executive_summary' in outputs:
+                combined_text += f"Executive Summary:{NEW_LINE}{outputs['executive_summary']}{NEW_LINE}{NEW_LINE}"
+            
+            # Add tool results
             for tool, result in results.items():
-                combined_text += f"--- {tool} RESULT ---\n{result[:500]}\n\n"
+                result_text = result[:1000] + "..." if isinstance(result, str) and len(result) > 1000 else str(result)
+                combined_text += f"--- {tool} RESULT ---{NEW_LINE}{result_text}{NEW_LINE}{NEW_LINE}"
+            
+            # Add action plan if available
+            if outputs and 'action_plan' in outputs:
+                combined_text += f"Action Plan:{NEW_LINE}{outputs['action_plan']}{NEW_LINE}{NEW_LINE}"
             
             # Create embeddings
             embeddings = self.embedding_function([combined_text])
             
             # Generate a unique ID
-            result_id = f"goal_result_{goal['id']}_{id_generator(10)}"
+            result_id = f"goal_result_{goal['id']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
-            # # Create metadata
-            # metadata = {
-            #     "type": "goal_execution",
-            #     "goal_id": goal['id'],
-            #     "goal_description": goal['description'],
-            #     "tools_used": tools_used,
-            #     "timestamp": datetime.now().isoformat(),
-            #     "success": True  # Assuming success if we get here
-            # }
+            # Create metadata
+            metadata = {
+                "type": "goal_execution",
+                "goal_id": goal['id'],
+                "goal_description": goal['description'],
+                "tools_used": tools_used,
+                "timestamp": datetime.now().isoformat(),
+                "success": True,  # Assuming success if we get here
+                "output_types": list(outputs.keys()) if outputs else []
+            }
             
             # Store in vector database
             self.core_collection.add(
                 ids=[result_id],
                 embeddings=embeddings,
+                metadatas=[metadata]
             )
             
-            # Add to execution history in memory
-            self.agent_memory['execution_history'].append({
+            # Add to execution history in memory with enhanced tracking
+            execution_record = {
                 "goal_id": goal['id'],
                 "timestamp": datetime.now().isoformat(),
                 "tools_used": tools_used,
                 "summary": execution_summary,
-                "result_id": result_id
-            })
+                "result_id": result_id,
+                "output_location": metadata.get("output_location", ""),
+                "performance_metrics": {
+                    "total_execution_time": sum(step.get("execution_time", 0) for step in execution_summary),
+                    "tool_count": len(tools_used),
+                    "success_rate": sum(1 for step in execution_summary if step.get("success", False)) / len(execution_summary) if execution_summary else 0
+                }
+            }
             
-            self.log(f"Stored goal execution results in memory: {result_id}", "INFO")
+            self.agent_memory['execution_history'].append(execution_record)
+            
+            # Update goal statistics
+            if 'goal_statistics' not in self.agent_memory:
+                self.agent_memory['goal_statistics'] = {}
+                
+            self.agent_memory['goal_statistics'][goal['id']] = {
+                "last_execution": datetime.now().isoformat(),
+                "execution_count": self.agent_memory['goal_statistics'].get(goal['id'], {}).get("execution_count", 0) + 1,
+                "tools_used": tools_used,
+                "success": True,
+                "result_id": result_id
+            }
+            
+            self.log(f"Stored comprehensive goal execution results: {result_id}", "INFO")
+            return result_id
             
         except Exception as e:
             self.log(f"Error storing goal results: {str(e)}", "ERROR")
-    
+            return None
+        
     def reflect_on_progress(self, completed_goal, success):
         """Use LangChain for reflection and planning"""
         # First, retrieve relevant memory from vector store
@@ -1765,9 +2247,9 @@ class AutonomousAgent:
         """Enhanced logging with levels"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if level == "ERROR":
-            print(f"[{timestamp}] \033[91mERROR: {message}\033[0m")  # Red text for errors
+            print(f"[{timestamp}] \033[91mERROR: {message}")  # Red text for errors
         elif level == "WARNING":
-            print(f"[{timestamp}] \033[93mWARNING: {message}\033[0m")  # Yellow text for warnings
+            print(f"[{timestamp}] \033[93mWARNING: {message}")  # Yellow text for warnings
         elif self.verbose or level == "ERROR" or level == "WARNING":
             print(f"[{timestamp}] {message}")
         
@@ -1780,7 +2262,7 @@ class AutonomousAgent:
     def get_human_feedback(self, message=""):
         """Get structured feedback from human"""
         prompt = message if message else "Enter feedback (or press Enter to continue):"
-        print(f"\n\033[94m{prompt}\033[0m")  # Blue text for prompt
+        print(f"\n{BLUE}{prompt}")  # Blue text for prompt
         
         feedback = input("> ").strip()
         
