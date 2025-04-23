@@ -1459,6 +1459,7 @@ class AutonomousAgent:
             # 6. Generate Code Analysis
             outputs["code_analysis"] = self._generate_code_analysis(complete_solution)
             
+            outputs["complete_solution"] = complete_solution
             # Include standard outputs
             outputs.update(self._load_standard_outputs(goal, tools_used, execution_summary, results, raw_outputs))
             
@@ -1539,7 +1540,7 @@ class AutonomousAgent:
             "expanded_code": expanded_code,
             "goal_description": goal_description
         })
-        return self._extract_code_blocks(solution)
+        return solution
 
     def _validate_and_fallback(self, solution, goal_description):
         """Ensure valid code output with fallback generation"""
@@ -1563,25 +1564,7 @@ class AutonomousAgent:
             chain = prompt | self.llm | StrOutputParser()
             solution = chain.invoke({"goal_description": goal_description})
         
-        return self._extract_code_blocks(solution)
-
-    def _extract_code_blocks(self, content):
-        """Flexible code extraction from various formats"""
-        # Try strict markdown code blocks
-        code_blocks = re.findall(r'```(?:\w+)?\s*([\s\S]*?)\s*```', content)
-        if code_blocks:
-            return "\n\n".join(code_blocks)
-        
-        # Fallback to indented code blocks
-        code_blocks = re.findall(r'^(?: {4}|\t).*$', content, re.MULTILINE)
-        if code_blocks:
-            return "\n".join(code_blocks)
-        
-        # Final fallback - return content if it looks code-like
-        if any(kw in content for kw in ['def ', 'class ', 'import ', 'return ']):
-            return content
-        
-        return ""
+        return solution
 
     def _generate_documentation(self, expanded_code, solution, goal_description):
         """Generate comprehensive documentation"""
