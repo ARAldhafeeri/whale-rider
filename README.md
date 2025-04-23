@@ -79,6 +79,7 @@ python agent.py --objective "Your objective here" [--max_iterations 5] [--verbos
 - `--objective`: The main objective for the agent (required)
 - `--max_iterations`: Maximum number of iterations (default: 5)
 - `--verbose`: Enable verbose output
+- `--auto`: Disable human feedback between iterations and the tool runs in auto pilot mode without human interfention.
 
 ### Example
 
@@ -102,13 +103,18 @@ The dashboard shows:
 - Human feedback
 - Live logs
 
+As well for every goal, there is going to be .html output open it to see valuable data.
+
 ## File Structure
 
 - `./workspace/`: Main working directory
   - `agent_memory.json`: Persistent memory storage
   - `docs/`: Documentation files
   - `logs/`: Execution logs
+  - `goal_x/`: Goals executed where most of the tool output lives
   - `checkpoints/`: Agent state snapshots
+
+The tool may create other folders files.
 
 ## Custom Tools
 

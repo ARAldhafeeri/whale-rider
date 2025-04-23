@@ -292,7 +292,7 @@ def read_directory(path: str = "./workspace") -> str:
         return f"Error reading directory: {str(e)}"
 
 class AutonomousAgent:
-    def __init__(self, objective, model, api_key, api_base, max_iterations=5, verbose=False):
+    def __init__(self, objective, model, api_key, api_base, max_iterations=5, verbose=False, auto=False):
         self.memory_file = "./workspace/agent_memory.json"
         self.objective = objective
         self.max_iterations = max_iterations
@@ -300,6 +300,7 @@ class AutonomousAgent:
         self.goals = []
         self.verbose = verbose
         self.human_feedback = ""
+        self.auto = auto
         
         # Ensure workspace directory exists
         if not os.path.exists("./workspace"):
@@ -675,9 +676,6 @@ class AutonomousAgent:
         # Process the highest priority goal
         goal = ready_goals[0]
         self.log(f"Processing goal: {goal['description']} (priority: {goal['priority']})")
-        
-        # Get human feedback before executing goal
-        # self.get_human_feedback(f"About to execute goal: {goal['description']}\nAny specific instructions?")
         
         result = self._execute_goal(goal)
         
@@ -3039,8 +3037,10 @@ class AutonomousAgent:
             
             self.log(f"\n=== Iteration {self.current_iteration + 1}/{self.max_iterations} ===")
             
+            user_feedback = None
             # Get human feedback before starting the iteration
-            user_feedback = self.get_human_feedback("Give the agent any specific input before the iteration start:")
+            if not self.auto:
+                user_feedback = self.get_human_feedback("Give the agent any specific input before the iteration start:")
             
             # Save checkpoint before the iteration
             self.save_checkpoint()
@@ -3282,6 +3282,7 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, required=True, help='The main objective for the agent')
     parser.add_argument('--max_iterations', type=int, default=5, help='Maximum number of iterations')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--auto', action='store_true', help='Run on auto pilot mode no human feedback between iterations')
 
     args = parser.parse_args()
     
@@ -3291,7 +3292,8 @@ if __name__ == "__main__":
         model=model,
         verbose=args.verbose,
         api_base=api_base,
-        api_key=api_key
+        api_key=api_key,
+        auto=args.auto
     )
     
     summary = agent.run()
